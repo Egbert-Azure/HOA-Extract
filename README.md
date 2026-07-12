@@ -74,10 +74,8 @@ You never need to tell it which is which — it sniffs the file header.
 
 | Packet | net cash | reserve (book) |
 |---|---|---|
-| Dec-2024 (OCR) | 1,170.59 | 83,565.98 |
-| Sep-2025 (embedded txt) | −2,441.65 | 86,774.39 |
-| Nov-2025 (text PDF) | −4,862.33 | 62,303.43 |
-| Dec-2025 (text PDF) | −3,969.73 | 63,759.04 |
-| Jan-2026 (text PDF) | −10,704.67 | 65,606.47 |
-
-If you edit the script, rerun these five and check the numbers still match.
+| Dec-2024 (OCR) |
+| Sep-2025 (embedded txt) |
+| Nov-2025 (text PDF) | 
+| Dec-2025 (text PDF) |
+| Jan-2026 (text PDF) | 
