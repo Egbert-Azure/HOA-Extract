@@ -22,8 +22,8 @@ For each file it extracts:
 
 Then it flags: **negative net cash**, net cash below the $2,000 floor, reserve APY below
 1%, bundle charges more than 5% over the Exhibit A $98.33, and any aged AP. The
-thresholds are the four constants at the top of the script — edit them there when you
-sign the new contract (new bundle rate, new cash floor, etc.).
+thresholds are the four constants at the top of the script — need to be edited when the contract
+changed (new bundle rate, new cash floor, etc.).
 
 ## Installation (one time)
 
