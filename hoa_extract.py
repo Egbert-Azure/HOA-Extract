@@ -32,6 +32,7 @@ OUT_DIR = "hoa_extract_out"
 EXHIBIT_A_BUNDLE = 98.33      # contracted Office & Technology bundle, $/mo (eff. Jan 2025)
 NET_CASH_FLOOR = 2000.00      # alert if Net Available Cash below this
 APY_FLOOR = 1.00              # alert if reserve APY below this (%)
+IRRIGATION_OVER_FLOOR = 25.0  # alert if irrigation acct YTD runs over budget by more than this (%)
 # ---------------------------------------------------------------
 
 
@@ -180,7 +181,106 @@ def extract_metrics(text):
     if m:
         d["fine_income_note"] = m.group(0).strip()[:120]
 
+    # Utility-payee cash-out tracing (PSE electricity, City-of-Redmond water/stormwater),
+    # including the GL account each draft posts to. Flags metered water (billing-period
+    # descriptions) landing in an irrigation account (59200 pre-Jul-2025, 59030 after)
+    # rather than an account named "Water".
+    up = extract_utility_payees(text)
+    if up:
+        d["utility_payees"] = up
+        ytd_act, ytd_bud = extract_irrigation_budget(text)
+        if ytd_bud and ytd_bud > 0:
+            d["irrigation_ytd_actual"] = ytd_act
+            d["irrigation_ytd_budget"] = ytd_bud
+            d["irrigation_pct_over_ytd"] = round((ytd_act / ytd_bud - 1) * 100, 0)
+
     return d
+
+
+# ---- Payee-level utility drafts WITH the GL account each posts to ----
+UTIL_PAYEES = {
+    "pse_electric": r"Puget\s+Sound\s+Energy",
+    "redmond_utility": r"City\s+of\s+Redmond\s*-?\s*Utility\s+Billing",
+}
+IRRIGATION_GL = ("59030", "59200")   # accounts where Redmond metered water lands
+DATE_RANGE = r"\d{1,2}[./]\d{1,2}"    # a billing period in the desc => consumption, not repair
+
+
+def extract_utility_payees(text):
+    """For each utility-payee draft, capture the amount AND the GL account it posts to
+    (the GL line typically follows the draft line in the check register / GL detail).
+    Redmond drafts with a billing-period description that land in an irrigation account
+    are flagged water_in_irrigation. Returns {payee: {count, total,
+    water_misfiled_total, lines:[{amount, gl, water_in_irrigation}]}}."""
+    out = {}
+    lines = [l.rstrip() for l in text.splitlines()]
+    for key, payee in UTIL_PAYEES.items():
+        hits = []
+        for i, l in enumerate(lines):
+            if re.search(payee, l, re.I) and re.search(r"Inv\s*#", l, re.I):
+                amts = re.findall(r"(-?[\d,]+\.\d{2})", l)
+                if not amts:
+                    continue
+                amt = abs(float(amts[-1].replace(",", "")))
+                gl_num, gl_desc = "?", "(GL not found)"
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    m = re.search(r"(\d{5})\s*-\s*([^\n\r]+)", lines[j])
+                    if m:
+                        gl_num, gl_desc = m.group(1), m.group(2).strip()[:80]
+                        break
+                water_in_irrig = (
+                    key == "redmond_utility"
+                    and gl_num in IRRIGATION_GL
+                    and re.search(DATE_RANGE, gl_desc)
+                    and "storm" not in gl_desc.lower()
+                )
+                hits.append({"amount": amt, "gl": f"{gl_num} - {gl_desc}",
+                             "water_in_irrigation": water_in_irrig})
+        if hits:
+            # de-dupe identical (amount, gl) pairs that appear on both register & GL pages
+            seen, uniq = set(), []
+            for h in hits:
+                sig = (h["amount"], h["gl"])
+                if sig not in seen:
+                    seen.add(sig)
+                    uniq.append(h)
+            out[key] = {
+                "count": len(uniq),
+                "total": round(sum(h["amount"] for h in uniq), 2),
+                "water_misfiled_total": round(
+                    sum(h["amount"] for h in uniq if h["water_in_irrigation"]), 2),
+                "lines": uniq,
+            }
+    return out
+
+
+# Irrigation-account budget-vs-actual row (label wraps across lines, then 7 figures:
+# Actual Budget Var YTD-Actual YTD-Budget YTD-Var Annual-Budget). 59200 pre-rename, 59030 after.
+def extract_irrigation_budget(text):
+    """Return (ytd_actual, ytd_budget) for the irrigation acct, or (None, None).
+    YTD-vs-YTD is the honest mid-year comparison; a full-year over-budget figure only
+    lands correctly in the December packet (where YTD == full year).
+
+    Robust form: the account number can be followed by anything (label may wrap,
+    say 'Repairs & Maintenance', or be truncated by OCR) before the seven money
+    figures. We scan ALL occurrences and keep the one that is actually a budget
+    row (exactly seven money figures in a run), ignoring check-register lines that
+    have the same label but only one trailing number."""
+    money = r"\(?(-?[\d,]*\.\d{2})\)?"   # [\d,]* (not +) so leading-decimal like ".11" matches
+    # 59030/59200, then up to ~40 non-digit chars (the label, possibly wrapped),
+    # then seven money figures separated by whitespace.
+    pat = (r"59(?:030|200)\b[^\d\n]{0,40}?[A-Za-z][^\d]{0,40}?"
+           + money + (r"[ \t\r\n]+" + money) * 6)
+    best = None
+    for m in re.finditer(pat, text, re.I):
+        nums = [float(g.replace(",", "")) for g in m.groups()]
+        # sanity: annual budget (last) should be the largest-ish; YTD budget > 0
+        if nums[4] > 0:
+            best = nums
+            break
+    if not best:
+        return None, None
+    return best[3], best[4]   # YTD actual, YTD budget
 
 
 def red_flags(d):
@@ -202,6 +302,18 @@ def red_flags(d):
         worst = "90+" if item["over90"] else ("60+" if item["over60"] else "30+")
         amt = item["over90"] or item["over60"] or item["over30"]
         flags.append(f"AP aged {worst} days: ${amt:,.2f} — {item['line'][:70]}")
+    red = d.get("utility_payees", {}).get("redmond_utility")
+    if red and red.get("water_misfiled_total", 0) > 0:
+        pct = d.get("irrigation_pct_over_ytd")
+        if pct is not None and pct > IRRIGATION_OVER_FLOOR:
+            ytd = d["irrigation_ytd_actual"]
+            bud = d["irrigation_ytd_budget"]
+            flags.append(
+                f"Metered water ${red['water_misfiled_total']:,.2f} in irrigation acct; "
+                f"acct YTD ${ytd:,.2f} vs ${bud:,.2f} budget ({pct:+.0f}% YTD)")
+        elif pct is None:
+            flags.append(f"Metered water ${red['water_misfiled_total']:,.2f} posted to an "
+                         f"irrigation acct (budget line not parsed — check manually)")
     return flags
 
 
@@ -213,9 +325,26 @@ def write_report(name, d, flags, out_dir):
         lines.append("")
     lines.append("## Extracted metrics")
     for k, v in d.items():
-        if k == "ap_aged_items":
+        if k in ("ap_aged_items", "utility_payees"):
             continue
         lines.append(f"- **{k}**: {v}")
+
+    up = d.get("utility_payees")
+    if up:
+        lines.append("")
+        lines.append("## Utility drafts")
+        for payee, info in up.items():
+            label = {"pse_electric": "PSE (Electricity)",
+                     "redmond_utility": "City of Redmond (Water/Stormwater)"}.get(payee, payee)
+            header = f"- **{label}** — {info['count']} drafts, ${info['total']:,.2f} total"
+            if info.get("water_misfiled_total", 0) > 0:
+                header += f"  (water in irrigation acct: ${info['water_misfiled_total']:,.2f})"
+            lines.append(header)
+            for h in info["lines"]:
+                mark = "  [WATER]" if h["water_in_irrigation"] else ""
+                gl = h["gl"].strip()
+                lines.append(f"    - ${h['amount']:,.2f} -> {gl}{mark}")
+
     if not d:
         lines.append("- (nothing recognized — layout may have changed; check manually)")
     path = os.path.join(out_dir, name + ".md")
@@ -249,6 +378,8 @@ def main(paths):
             "reserve_apy_pct": d.get("reserve_apy_pct", ""),
             "ap_total": d.get("ap_total", ""),
             "office_bundle_max": max(d.get("office_bundle_charges", [0]) or [0]),
+            "water_misfiled": d.get("utility_payees", {}).get(
+                "redmond_utility", {}).get("water_misfiled_total", ""),
             "red_flags": len(flags),
         })
     if rows:
