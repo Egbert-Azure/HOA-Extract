@@ -134,10 +134,26 @@ def extract_metrics(text):
     m = re.search(r"Total Cash Reserve\s*" + MONEY, text, re.I)
     if m:
         d["reserve_balance"] = money(m)
+    else:
+        # Summary "Financial Overview Report" format (Jun-2026 onward) labels this
+        # "Total Reserves:" in the Investments section instead of "Total Cash Reserve".
+        m = re.search(r"Total Reserves:\s*" + MONEY, text, re.I)
+        if m:
+            d["reserve_balance"] = money(m)
 
     m = re.search(r"(?:Annual percentage yield(?: earned)?|APY)[\s\S]{0,200}?(\d+\.\d+)\s*%", text, re.I)
     if m:
         d["reserve_apy_pct"] = float(m.group(1))
+    else:
+        # Summary format: reserve APY appears as the "Interest" column on the reserve
+        # account row, e.g. "AAB Reserve Account  Other DDA  $50,649.34  N/A  0.25%".
+        # Take the rate from the first reserve-account row that carries a $ amount.
+        for line in text.splitlines():
+            if re.search(r"reserve account", line, re.I):
+                mrow = re.search(r"\$\s?[\d,]+\.\d{2}.*?(\d+\.\d+)\s*%", line)
+                if mrow:
+                    d["reserve_apy_pct"] = float(mrow.group(1))
+                    break
 
     m = re.search(r"Interest (?:earned|Credit)\s*" + MONEY, text, re.I)
     if m:
@@ -193,6 +209,13 @@ def extract_metrics(text):
             d["irrigation_ytd_actual"] = ytd_act
             d["irrigation_ytd_budget"] = ytd_bud
             d["irrigation_pct_over_ytd"] = round((ytd_act / ytd_bud - 1) * 100, 0)
+
+    # Detect the summary-only "Financial Overview Report" format (Jun-2026 onward),
+    # which omits the vendor invoice register, AP-aging detail, and expense line items
+    # that full packets contain. Flag it so a thin month is a recorded data point
+    # rather than a silent under-extraction.
+    if re.search(r"Financial Overview Report", text, re.I) and not up:
+        d["packet_format"] = "summary_only"
 
     return d
 
@@ -285,6 +308,10 @@ def extract_irrigation_budget(text):
 
 def red_flags(d):
     flags = []
+    if d.get("packet_format") == "summary_only":
+        flags.append("SUMMARY-ONLY PACKET: detailed vendor/AP/expense lines not "
+                     "provided this month (bundle, water-misfiling, and AP-aging "
+                     "checks cannot run on a summary report)")
     nc = d.get("net_available_cash")
     if nc is not None:
         if nc < 0:
