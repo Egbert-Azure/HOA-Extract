@@ -161,11 +161,11 @@ def extract_metrics(text):
 
     # TMT bundle / office invoices (several label variants across years)
     vals = find_all_money(
-        r"(?:office bundle|Bundle and Office|Office & Tech(?:nology)?)[^\n$]{0,60}" + MONEY, text)
+        r"(?:office bundle|Bundle and Office|Office & Tech(?:nology)?)[^\n$]{0,60}?\s" + MONEY, text)
     if vals:
         d["office_bundle_charges"] = sorted(set(round(v, 2) for v in vals if 20 < v < 1500))
 
-    vals = find_all_money(r"(?:52600|Management Contract)[^\n$]{0,40}" + MONEY, text)
+    vals = find_all_money(r"(?:52600|Management Contract)[^\n$]{0,40}?\s" + MONEY, text)
     if vals:
         d["management_fee_lines"] = sorted(set(round(v, 2) for v in vals if 500 < v < 5000))
 
