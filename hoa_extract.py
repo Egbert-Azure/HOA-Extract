@@ -33,6 +33,8 @@ EXHIBIT_A_BUNDLE = 98.33      # contracted Office & Technology bundle, $/mo (eff
 NET_CASH_FLOOR = 2000.00      # alert if Net Available Cash below this
 APY_FLOOR = 1.00              # alert if reserve APY below this (%)
 IRRIGATION_OVER_FLOOR = 25.0  # alert if irrigation acct YTD runs over budget by more than this (%)
+LANDSCAPE_ACH_RATE = 2417.76  # Casa Bonita flat monthly service, ACH price (re-baseline on a real rate change)
+LANDSCAPE_CARD_RATE = 2502.14 # same service billed at the higher card/surcharge price
 # ---------------------------------------------------------------
 
 
@@ -217,6 +219,10 @@ def extract_metrics(text):
     if re.search(r"Financial Overview Report", text, re.I) and not up:
         d["packet_format"] = "summary_only"
 
+    ls = extract_landscape_rate(text)
+    if ls:
+        d["landscape_service_lines"] = ls
+
     return d
 
 
@@ -306,6 +312,49 @@ def extract_irrigation_budget(text):
     return best[3], best[4]   # YTD actual, YTD budget
 
 
+# ---- Landscape monthly service: card-rate-vs-ACH-rate check ----
+# Casa Bonita bills a flat monthly service fee with two prices on the same invoice:
+# a lower ACH rate and a higher card rate (the card figure carries a processing
+# surcharge). The association pays by ACH, so any month booked at or above the card
+# rate overstates the expense. A genuine ACH price increase will also trip this by
+# design — that is the intended catch; re-baseline LANDSCAPE_ACH_RATE when the
+# contracted rate legitimately changes.
+LANDSCAPE_VENDOR = r"Casa\s+Bonita"
+_MONTH_RE = r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b"
+
+
+def extract_landscape_rate(text):
+    """Casa Bonita monthly landscape/lawn service invoice lines, de-duped across the
+    AP-aging, GL-detail and check-register pages. Returns [{month, amount, invoice}].
+    Keeps only monthly-fee-magnitude figures so tiny reclass/partial amounts and
+    huge YTD roll-ups are excluded."""
+    seen, hits = set(), []
+    for l in (l.rstrip() for l in text.splitlines()):
+        if not re.search(LANDSCAPE_VENDOR, l, re.I):
+            continue
+        if not re.search(r"Landscap|Lawn", l, re.I):
+            continue
+        cand = [float(a.replace(",", "")) for a in re.findall(r"(-?[\d,]+\.\d{2})", l)]
+        cand = [a for a in cand if 1000 < a < 4000]
+        if not cand:
+            continue
+        amt = round(cand[0], 2)
+        # AP-aging / register lines carry "Inv # 223122"; GL / trial-balance lines put
+        # the invoice number immediately before the vendor name ("223122 - Casa Bonita"),
+        # sometimes preceded by a 7-digit ledger ID that must NOT be mistaken for it.
+        inv_m = (re.search(r"Inv\s*#?\s*(\d{5,7})", l, re.I)
+                 or re.search(r"(\d{5,6})\s*-\s*Casa\s+Bonita", l, re.I))
+        inv = inv_m.group(1) if inv_m else "?"
+        mo_m = re.search(_MONTH_RE, l, re.I)
+        month = mo_m.group(1).title() if mo_m else "?"
+        sig = (inv, amt)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        hits.append({"month": month, "amount": amt, "invoice": inv})
+    return hits
+
+
 def red_flags(d):
     flags = []
     if d.get("packet_format") == "summary_only":
@@ -341,6 +390,20 @@ def red_flags(d):
         elif pct is None:
             flags.append(f"Metered water ${red['water_misfiled_total']:,.2f} posted to an "
                          f"irrigation acct (budget line not parsed — check manually)")
+    for h in d.get("landscape_service_lines", []):
+        amt = h["amount"]
+        if amt > LANDSCAPE_ACH_RATE + 0.01:
+            delta = amt - LANDSCAPE_ACH_RATE
+            where = f"({h['month']}, inv {h['invoice']})"
+            if abs(amt - LANDSCAPE_CARD_RATE) < 0.01:
+                flags.append(
+                    f"Landscape booked at CARD rate ${amt:,.2f} {where} — ${delta:,.2f} over "
+                    f"ACH rate ${LANDSCAPE_ACH_RATE:,.2f}; paid by ACH, this overstates the line")
+            else:
+                flags.append(
+                    f"Landscape ${amt:,.2f} {where} is ${delta:,.2f} over ACH rate "
+                    f"${LANDSCAPE_ACH_RATE:,.2f} (card rate ${LANDSCAPE_CARD_RATE:,.2f}) — "
+                    f"confirm price increase vs card-rate misbooking")
     return flags
 
 
@@ -352,9 +415,18 @@ def write_report(name, d, flags, out_dir):
         lines.append("")
     lines.append("## Extracted metrics")
     for k, v in d.items():
-        if k in ("ap_aged_items", "utility_payees"):
+        if k in ("ap_aged_items", "utility_payees", "landscape_service_lines"):
             continue
         lines.append(f"- **{k}**: {v}")
+
+    ls = d.get("landscape_service_lines")
+    if ls:
+        lines.append("")
+        lines.append("## Landscape monthly service")
+        for h in ls:
+            over = (f"  [OVER ACH by ${h['amount'] - LANDSCAPE_ACH_RATE:,.2f}]"
+                    if h["amount"] > LANDSCAPE_ACH_RATE + 0.01 else "")
+            lines.append(f"- {h['month']}: ${h['amount']:,.2f} (inv {h['invoice']}){over}")
 
     up = d.get("utility_payees")
     if up:
@@ -407,6 +479,9 @@ def main(paths):
             "office_bundle_max": max(d.get("office_bundle_charges", [0]) or [0]),
             "water_misfiled": d.get("utility_payees", {}).get(
                 "redmond_utility", {}).get("water_misfiled_total", ""),
+            "landscape_over_ach": sum(
+                1 for h in d.get("landscape_service_lines", [])
+                if h["amount"] > LANDSCAPE_ACH_RATE + 0.01),
             "red_flags": len(flags),
         })
     if rows:
