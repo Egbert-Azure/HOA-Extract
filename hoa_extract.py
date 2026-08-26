@@ -324,35 +324,58 @@ _MONTH_RE = r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b"
 
 
 def extract_landscape_rate(text):
-    """Casa Bonita monthly landscape/lawn service invoice lines, de-duped across the
-    AP-aging, GL-detail and check-register pages. Returns [{month, amount, invoice}].
-    Keeps only monthly-fee-magnitude figures so tiny reclass/partial amounts and
-    huge YTD roll-ups are excluded."""
-    seen, hits = set(), []
+    """Casa Bonita monthly landscape/lawn service invoices, aggregated by invoice
+    number across the AP-aging, GL-detail and check-register pages. Returns
+    [{invoice, month, amounts, min, max, corrected}].
+
+    Keeps only monthly-fee-magnitude figures so tiny reclass/partial amounts and huge
+    YTD roll-ups are excluded. Correction is judged PER INVOICE, not per line, because
+    TMT reverses-and-rebooks: a card-rate entry that was fixed appears alongside an
+    at/below-ACH entry for the SAME invoice. If any booking for an invoice is at or
+    below the ACH rate, the correct rate landed (corrected=True, no net overcharge);
+    only when EVERY booking for an invoice is above the ACH rate is it a real
+    overcharge."""
+    by_inv, order = {}, []
     for l in (l.rstrip() for l in text.splitlines()):
         if not re.search(LANDSCAPE_VENDOR, l, re.I):
             continue
         if not re.search(r"Landscap|Lawn", l, re.I):
             continue
-        cand = [float(a.replace(",", "")) for a in re.findall(r"(-?[\d,]+\.\d{2})", l)]
-        cand = [a for a in cand if 1000 < a < 4000]
+        cand = [a for a in
+                (float(x.replace(",", "")) for x in re.findall(r"([\d,]+\.\d{2})", l))
+                if 1000 < a < 4000]
         if not cand:
             continue
         amt = round(cand[0], 2)
         # AP-aging / register lines carry "Inv # 223122"; GL / trial-balance lines put
-        # the invoice number immediately before the vendor name ("223122 - Casa Bonita"),
-        # sometimes preceded by a 7-digit ledger ID that must NOT be mistaken for it.
+        # the invoice number just before the vendor name ("223122 - Casa Bonita"),
+        # sometimes preceded by a 7-digit ledger ID that must NOT be taken as it.
         inv_m = (re.search(r"Inv\s*#?\s*(\d{5,7})", l, re.I)
                  or re.search(r"(\d{5,6})\s*-\s*Casa\s+Bonita", l, re.I))
         inv = inv_m.group(1) if inv_m else "?"
         mo_m = re.search(_MONTH_RE, l, re.I)
         month = mo_m.group(1).title() if mo_m else "?"
-        sig = (inv, amt)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        hits.append({"month": month, "amount": amt, "invoice": inv})
-    return hits
+        if inv not in by_inv:
+            by_inv[inv] = {"month": month, "amounts": set()}
+            order.append(inv)
+        rec = by_inv[inv]
+        rec["amounts"].add(amt)
+        if rec["month"] == "?" and month != "?":
+            rec["month"] = month
+
+    out = []
+    for inv in order:
+        amts = sorted(by_inv[inv]["amounts"])
+        out.append({
+            "invoice": inv,
+            "month": by_inv[inv]["month"],
+            "amounts": amts,
+            "min": amts[0],
+            "max": amts[-1],
+            "corrected": amts[-1] > LANDSCAPE_ACH_RATE + 0.01
+                         and amts[0] <= LANDSCAPE_ACH_RATE + 0.01,
+        })
+    return out
 
 
 def red_flags(d):
@@ -391,19 +414,23 @@ def red_flags(d):
             flags.append(f"Metered water ${red['water_misfiled_total']:,.2f} posted to an "
                          f"irrigation acct (budget line not parsed — check manually)")
     for h in d.get("landscape_service_lines", []):
-        amt = h["amount"]
-        if amt > LANDSCAPE_ACH_RATE + 0.01:
-            delta = amt - LANDSCAPE_ACH_RATE
-            where = f"({h['month']}, inv {h['invoice']})"
-            if abs(amt - LANDSCAPE_CARD_RATE) < 0.01:
+        mx, mn = h["max"], h["min"]
+        where = f"({h['month']}, inv {h['invoice']})"
+        if mn > LANDSCAPE_ACH_RATE + 0.01:
+            delta = mx - LANDSCAPE_ACH_RATE
+            if abs(mx - LANDSCAPE_CARD_RATE) < 0.01:
                 flags.append(
-                    f"Landscape booked at CARD rate ${amt:,.2f} {where} — ${delta:,.2f} over "
+                    f"Landscape booked at CARD rate ${mx:,.2f} {where} — ${delta:,.2f} over "
                     f"ACH rate ${LANDSCAPE_ACH_RATE:,.2f}; paid by ACH, this overstates the line")
             else:
                 flags.append(
-                    f"Landscape ${amt:,.2f} {where} is ${delta:,.2f} over ACH rate "
+                    f"Landscape ${mx:,.2f} {where} is ${delta:,.2f} over ACH rate "
                     f"${LANDSCAPE_ACH_RATE:,.2f} (card rate ${LANDSCAPE_CARD_RATE:,.2f}) — "
                     f"confirm price increase vs card-rate misbooking")
+        elif h["corrected"]:
+            flags.append(
+                f"NOTE: landscape card rate ${mx:,.2f} {where} was booked then corrected to "
+                f"the ACH rate ${LANDSCAPE_ACH_RATE:,.2f} this packet — no net overcharge")
     return flags
 
 
@@ -424,9 +451,14 @@ def write_report(name, d, flags, out_dir):
         lines.append("")
         lines.append("## Landscape monthly service")
         for h in ls:
-            over = (f"  [OVER ACH by ${h['amount'] - LANDSCAPE_ACH_RATE:,.2f}]"
-                    if h["amount"] > LANDSCAPE_ACH_RATE + 0.01 else "")
-            lines.append(f"- {h['month']}: ${h['amount']:,.2f} (inv {h['invoice']}){over}")
+            amt_str = ", ".join(f"${a:,.2f}" for a in h["amounts"])
+            if h["min"] > LANDSCAPE_ACH_RATE + 0.01:
+                tag = "  [OVER ACH — not corrected]"
+            elif h["corrected"]:
+                tag = "  [card rate booked, corrected to ACH]"
+            else:
+                tag = ""
+            lines.append(f"- {h['month']} inv {h['invoice']}: {amt_str}{tag}")
 
     up = d.get("utility_payees")
     if up:
@@ -481,7 +513,7 @@ def main(paths):
                 "redmond_utility", {}).get("water_misfiled_total", ""),
             "landscape_over_ach": sum(
                 1 for h in d.get("landscape_service_lines", [])
-                if h["amount"] > LANDSCAPE_ACH_RATE + 0.01),
+                if h["min"] > LANDSCAPE_ACH_RATE + 0.01),
             "red_flags": len(flags),
         })
     if rows:
