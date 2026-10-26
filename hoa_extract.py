@@ -35,6 +35,8 @@ APY_FLOOR = 1.00              # alert if reserve APY below this (%)
 IRRIGATION_OVER_FLOOR = 25.0  # alert if irrigation acct YTD runs over budget by more than this (%)
 LANDSCAPE_ACH_RATE = 2417.76  # Casa Bonita flat monthly service, ACH price (re-baseline on a real rate change)
 LANDSCAPE_CARD_RATE = 2502.14 # same service billed at the higher card/surcharge price
+OWED_TO_RESERVE_FLOOR = 2000.00  # alert if operating owes the reserve more than this
+                                 # (~one month's reserve contribution, $1,834.17 in 2026)
 # ---------------------------------------------------------------
 
 
@@ -143,6 +145,21 @@ def extract_metrics(text):
         if m:
             d["reserve_balance"] = money(m)
 
+    # Inter-fund IOU on the balance sheet ("14999 - Due To/(From) Reserves"):
+    # positive = operating owes the reserve. The book "Total Cash Reserve" includes
+    # it, so reserve cash (acct 12000, ties to the bank statement apart from transfers
+    # in transit) = book - IOU. Read ONLY the balance-sheet lines just above "Total
+    # Cash Reserve": the GL trial balance repeats the label with opening balances.
+    mt = re.search(r"Total Cash Reserve\s*" + MONEY, text, re.I)
+    if mt and "reserve_balance" in d:
+        seg = text[max(0, mt.start() - 600):mt.start()]
+        owed = 0.0   # no 14999 line on the balance sheet => nothing owed
+        for mo in re.finditer(r"Due To/\(From\) Reserves\s*(?=" + MONEY + ")", seg, re.I):
+            # amount matched on its own: the label's "(From)" must not read as negative
+            owed = money(re.compile(MONEY).match(seg, mo.end()))
+        d["owed_to_reserve"] = owed
+        d["reserve_cash"] = round(d["reserve_balance"] - owed, 2)
+
     m = re.search(r"(?:Annual percentage yield(?: earned)?|APY)[\s\S]{0,200}?(\d+\.\d+)\s*%", text, re.I)
     if m:
         d["reserve_apy_pct"] = float(m.group(1))
@@ -219,11 +236,117 @@ def extract_metrics(text):
     if re.search(r"Financial Overview Report", text, re.I) and not up:
         d["packet_format"] = "summary_only"
 
+    # Water bills first booked to a "Water" account, then moved into the irrigation
+    # account by a month-end journal entry (first seen Sep-2026, JE 1121355).
+    wr = extract_water_reclass(text)
+    if wr:
+        d["water_reclass_to_irrigation"] = wr
+
+    # Reserve -> operating cash transfers (bank reconciliation, operating side) and
+    # monthly reserve contributions booked but not yet moved to the reserve bank
+    # account (Due To/From schedule). Informational; the IOU itself is flagged.
+    xf = extract_reserve_transfers(text)
+    if xf:
+        d["reserve_transfers_out"] = xf
+    rc = extract_contributions_not_transferred(text)
+    if rc:
+        d["reserve_contributions_not_transferred"] = rc
+
     ls = extract_landscape_rate(text)
     if ls:
         d["landscape_service_lines"] = ls
 
     return d
+
+
+# ---- Journal entries moving water charges into the irrigation account ----
+_JE_HEAD = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s+-\s+(\d+)\s+-\s+(.*\S)\s*$")
+_JE_LINE = re.compile(r"^\s*(\d{5})\s*-\s+(\S.*?)\s{2,}.*\s(-|[\d,]*\.\d{2})\s+(-|[\d,]*\.\d{2})\s*$")
+
+
+def _amt(s):
+    return 0.0 if s == "-" else float(s.replace(",", ""))
+
+
+def extract_water_reclass(text):
+    """GL Entry Report journal entries that debit the irrigation account and credit an
+    account labelled 'Water' (not Storm Water). Returns [{date, entry, desc, amount}];
+    amount is negative if the entry moves water OUT of irrigation (a correction)."""
+    lines = text.splitlines()
+    out = []
+    for i, l in enumerate(lines):
+        h = _JE_HEAD.match(l)
+        if not h:
+            continue
+        irr_dr = irr_cr = wat_dr = wat_cr = 0.0
+        seen_gl = False
+        for nl in lines[i + 1:i + 15]:
+            if not nl.strip():
+                if seen_gl:
+                    break
+                continue
+            if _JE_HEAD.match(nl):
+                break
+            g = _JE_LINE.match(nl)
+            if not g:
+                continue
+            seen_gl = True
+            gl, label, dr, cr = g.group(1), g.group(2), _amt(g.group(3)), _amt(g.group(4))
+            if gl in IRRIGATION_GL:
+                irr_dr += dr
+                irr_cr += cr
+            elif re.match(r"Water\b", label, re.I):
+                wat_dr += dr
+                wat_cr += cr
+        amt = min(irr_dr, wat_cr) - min(irr_cr, wat_dr)
+        if abs(amt) > 0.005:
+            out.append({"date": h.group(1), "entry": h.group(2),
+                        "desc": h.group(3)[:60], "amount": round(amt, 2)})
+    return out
+
+
+def water_in_irrigation(d):
+    """(total, via_reclass): metered water that ended up in the irrigation account,
+    whether posted there directly or moved there by journal entry."""
+    direct = d.get("utility_payees", {}).get("redmond_utility", {}).get(
+        "water_misfiled_total", 0) or 0
+    recl = sum(r["amount"] for r in d.get("water_reclass_to_irrigation", []))
+    return round(direct + recl, 2), round(recl, 2)
+
+
+def extract_reserve_transfers(text):
+    """'Transfer from ... Reserve ...' lines on the operating side of the bank
+    reconciliation. Returns [{date, desc, amount}], de-duplicated."""
+    out, seen = [], set()
+    # The SOURCE account (between "Transfer from" and the first " - ") must be the
+    # reserve account; "Transfer from AAB Operating Checking - March Reserves Funding"
+    # is a contribution INTO the reserve and must not match.
+    for m in re.finditer(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s+(Transfer from [^\n]*?Reserve[^\n-]*?"
+                         r"\s-\s[^\n]*?)\s+(-?[\d,]+\.\d{2})\s*$", text, re.M | re.I):
+        if not re.match(r"Transfer from [^-]*Reserve", m.group(2), re.I):
+            continue
+        amt = abs(float(m.group(3).replace(",", "")))
+        sig = (m.group(1), amt)
+        if sig not in seen:
+            seen.add(sig)
+            out.append({"date": m.group(1), "desc": re.sub(r"\s+", " ", m.group(2))[:80],
+                        "amount": amt})
+    return out
+
+
+def extract_contributions_not_transferred(text):
+    """'<Month> Reserve Contribution' rows in the Due To/From schedule (section
+    'Reserve allocation outstanding'): contributions booked to the reserve fund whose
+    cash is still in operating. Returns [{date, desc, amount}]."""
+    blk = re.search(r"DUE TO/\(FROM\) SCHEDULE.*?(?=\f|\Z)", text, re.S | re.I)
+    if not blk:
+        return []
+    out = []
+    for m in re.finditer(r"^\s*\d{5}\s+(\d{1,2}/\d{1,2}/\d{4})\s+(.*?Reserve Contribution)"
+                         r"\s+\$?\s*\(?([\d,]+\.\d{2})\)?", blk.group(0), re.M | re.I):
+        out.append({"date": m.group(1), "desc": m.group(2).strip(),
+                    "amount": float(m.group(3).replace(",", ""))})
+    return out
 
 
 # ---- Payee-level utility drafts WITH the GL account each posts to ----
@@ -401,18 +524,32 @@ def red_flags(d):
         worst = "90+" if item["over90"] else ("60+" if item["over60"] else "30+")
         amt = item["over90"] or item["over60"] or item["over30"]
         flags.append(f"AP aged {worst} days: ${amt:,.2f} — {item['line'][:70]}")
-    red = d.get("utility_payees", {}).get("redmond_utility")
-    if red and red.get("water_misfiled_total", 0) > 0:
-        pct = d.get("irrigation_pct_over_ytd")
-        if pct is not None and pct > IRRIGATION_OVER_FLOOR:
-            ytd = d["irrigation_ytd_actual"]
-            bud = d["irrigation_ytd_budget"]
-            flags.append(
-                f"Metered water ${red['water_misfiled_total']:,.2f} in irrigation acct; "
-                f"acct YTD ${ytd:,.2f} vs ${bud:,.2f} budget ({pct:+.0f}% YTD)")
-        elif pct is None:
-            flags.append(f"Metered water ${red['water_misfiled_total']:,.2f} posted to an "
-                         f"irrigation acct (budget line not parsed — check manually)")
+    # Irrigation overspend is flagged on its own; metered water in the account (posted
+    # directly, or moved there by journal entry) is added as context. Before Oct-2026
+    # this flag only fired when water was POSTED directly to irrigation, so a month
+    # where TMT booked water to a Water acct and reclassed it at month-end lost the flag.
+    water, recl = water_in_irrigation(d)
+    recl_note = ""
+    if recl > 0:
+        jes = d["water_reclass_to_irrigation"]
+        recl_note = (" (moved from the Water acct by journal entry "
+                     + ", ".join(f"{r['entry']} on {r['date']}" for r in jes) + ")")
+    pct = d.get("irrigation_pct_over_ytd")
+    if pct is not None and pct > IRRIGATION_OVER_FLOOR:
+        ytd = d["irrigation_ytd_actual"]
+        bud = d["irrigation_ytd_budget"]
+        tail = f"acct YTD ${ytd:,.2f} vs ${bud:,.2f} budget ({pct:+.0f}% YTD)"
+        if water > 0:
+            flags.append(f"Metered water ${water:,.2f} in irrigation acct{recl_note}; {tail}")
+        else:
+            flags.append(f"Irrigation {tail}")
+    elif pct is None and water > 0:
+        flags.append(f"Metered water ${water:,.2f} posted to an irrigation acct{recl_note} "
+                     f"(budget line not parsed — check manually)")
+    owed = d.get("owed_to_reserve")
+    if owed is not None and owed > OWED_TO_RESERVE_FLOOR:
+        flags.append(f"Operating owes reserve ${owed:,.2f}: reserve cash "
+                     f"${d['reserve_cash']:,.2f} vs book ${d['reserve_balance']:,.2f}")
     for h in d.get("landscape_service_lines", []):
         mx, mn = h["max"], h["min"]
         where = f"({h['month']}, inv {h['invoice']})"
@@ -442,9 +579,29 @@ def write_report(name, d, flags, out_dir):
         lines.append("")
     lines.append("## Extracted metrics")
     for k, v in d.items():
-        if k in ("ap_aged_items", "utility_payees", "landscape_service_lines"):
+        if k in ("ap_aged_items", "utility_payees", "landscape_service_lines",
+                 "water_reclass_to_irrigation", "reserve_transfers_out",
+                 "reserve_contributions_not_transferred"):
             continue
         lines.append(f"- **{k}**: {v}")
+
+    if "owed_to_reserve" in d or d.get("reserve_transfers_out") \
+            or d.get("reserve_contributions_not_transferred"):
+        lines.append("")
+        lines.append("## Reserve cash")
+        if "owed_to_reserve" in d:
+            lines.append(f"- Reserve per balance sheet (book): ${d['reserve_balance']:,.2f}")
+            lines.append(f"- Reserve cash (acct 12000, ties to bank statement): ${d['reserve_cash']:,.2f}")
+            lines.append(f"- Owed by operating to reserve: ${d['owed_to_reserve']:,.2f}")
+        rc = d.get("reserve_contributions_not_transferred")
+        if rc:
+            lines.append(f"- Reserve contributions not yet transferred: {len(rc)} "
+                         f"(${sum(r['amount'] for r in rc):,.2f})")
+            for r in rc:
+                lines.append(f"    - {r['date']} {r['desc']} ${r['amount']:,.2f}")
+        for x in d.get("reserve_transfers_out", []):
+            lines.append(f"- Reserve -> operating transfer {x['date']}: ${x['amount']:,.2f} "
+                         f"— {x['desc']}")
 
     ls = d.get("landscape_service_lines")
     if ls:
@@ -471,8 +628,12 @@ def write_report(name, d, flags, out_dir):
             if info.get("water_misfiled_total", 0) > 0:
                 header += f"  (water in irrigation acct: ${info['water_misfiled_total']:,.2f})"
             lines.append(header)
+            recl = d.get("water_reclass_to_irrigation")
             for h in info["lines"]:
                 mark = "  [WATER]" if h["water_in_irrigation"] else ""
+                if (recl and payee == "redmond_utility"
+                        and re.search(r"^\d{5}\s*-\s*Water\b", h["gl"], re.I)):
+                    mark = "  [WATER — moved to irrigation by journal entry]"
                 gl = h["gl"].strip()
                 lines.append(f"    - ${h['amount']:,.2f} -> {gl}{mark}")
 
@@ -506,11 +667,14 @@ def main(paths):
             "file": name,
             "net_available_cash": d.get("net_available_cash", ""),
             "reserve_balance": d.get("reserve_balance", ""),
+            "reserve_cash": d.get("reserve_cash", ""),
+            "owed_to_reserve": d.get("owed_to_reserve", ""),
             "reserve_apy_pct": d.get("reserve_apy_pct", ""),
             "ap_total": d.get("ap_total", ""),
             "office_bundle_max": max(d.get("office_bundle_charges", [0]) or [0]),
-            "water_misfiled": d.get("utility_payees", {}).get(
-                "redmond_utility", {}).get("water_misfiled_total", ""),
+            "water_misfiled": (water_in_irrigation(d)[0]
+                               if ("redmond_utility" in d.get("utility_payees", {})
+                                   or d.get("water_reclass_to_irrigation")) else ""),
             "landscape_over_ach": sum(
                 1 for h in d.get("landscape_service_lines", [])
                 if h["min"] > LANDSCAPE_ACH_RATE + 0.01),
